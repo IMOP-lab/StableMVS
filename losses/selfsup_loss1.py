@@ -1,0 +1,877 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torchvision import models
+from models.module import *
+import time
+from torch.autograd import Variable
+import numpy as np
+from math import exp
+import matplotlib.pyplot as plt
+
+## the first version  of loss_photo, loss_ssim, loss_perceptual (new version)
+
+class vggNet(nn.Module):
+    def __init__(self, pretrained=True):
+        super(vggNet, self).__init__()
+        self.net = models.vgg16(pretrained=True).features.eval()
+
+    def forward(self, x):
+
+        out = []
+        for i in range(len(self.net)):
+            #x = self.net[i](x)
+            x = self.net[i](x)
+            #if i in [3, 8, 15, 22, 29]:#提取1,1/2,1/4,1/8,1/16
+            if i in [3, 8, 15]: #提取1，1/2，1/4的特征图
+                # print(self.net[i])
+                out.append(x)
+        return out
+
+
+############## unsupervised loss  #####################
+
+def _bilinear_sample(im, x, y, name='bilinear_sampler'):
+    """Perform bilinear sampling on im given list of x, y coordinates.
+    Implements the differentiable sampling mechanism with bilinear kernel
+    in https://arxiv.org/abs/1506.02025.
+    x,y are tensors specifying normalized coordinates [-1, 1] to be sampled on im.
+    For example, (-1, -1) in (x, y) corresponds to pixel location (0, 0) in im,
+    and (1, 1) in (x, y) corresponds to the bottom right pixel in im.
+    Args:
+        im: Batch of images with shape [B, h, w, channels].
+        x: Tensor of normalized x coordinates in [-1, 1], with shape [B, h, w, 1].
+        y: Tensor of normalized y coordinates in [-1, 1], with shape [B, h, w, 1].
+        name: Name scope for ops.
+    Returns:
+        Sampled image with shape [B, h, w, channels].
+        Principled mask with shape [B, h, w, 1], dtype:float32.  A value of 1.0
+        in the mask indicates that the corresponding coordinate in the sampled
+        image is valid.
+      """
+    x = x.reshape(-1)  # [batch_size * height * width]
+    y = y.reshape(-1)  # [batch_size * height * width]
+
+    # Constants.
+    batch_size, height, width, channels = im.shape
+
+    x, y = x.float(), y.float()
+    max_y = int(height - 1)
+    max_x = int(width - 1)
+
+    # Scale indices from [-1, 1] to [0, width - 1] or [0, height - 1].
+    x = (x + 1.0) * (width - 1.0) / 2.0
+    y = (y + 1.0) * (height - 1.0) / 2.0
+
+    # Compute the coordinates of the 4 pixels to sample from.
+    x0 = torch.floor(x).int()
+    x1 = x0 + 1
+    y0 = torch.floor(y).int()
+    y1 = y0 + 1
+
+    mask = (x0 >= 0) & (x1 <= max_x) & (y0 >= 0) & (y0 <= max_y)
+    mask = mask.float()
+
+    x0 = torch.clamp(x0, 0, max_x)
+    x1 = torch.clamp(x1, 0, max_x)
+    y0 = torch.clamp(y0, 0, max_y)
+    y1 = torch.clamp(y1, 0, max_y)
+    dim2 = width
+    dim1 = width * height
+
+    # Create base index.
+    base = torch.arange(batch_size) * dim1
+    base = base.reshape(-1, 1)
+    base = base.repeat(1, height * width)
+    base = base.reshape(-1)  # [batch_size * height * width]
+    base = base.long().to('cuda')
+
+    base_y0 = base + y0.long() * dim2
+    base_y1 = base + y1.long() * dim2
+    idx_a = base_y0 + x0.long()
+    idx_b = base_y1 + x0.long()
+    idx_c = base_y0 + x1.long()
+    idx_d = base_y1 + x1.long()
+
+    # Use indices to lookup pixels in the flat image and restore channels dim.
+    im_flat = im.reshape(-1, channels).float()  # [batch_size * height * width, channels]
+    # pixel_a = tf.gather(im_flat, idx_a)
+    # pixel_b = tf.gather(im_flat, idx_b)
+    # pixel_c = tf.gather(im_flat, idx_c)
+    # pixel_d = tf.gather(im_flat, idx_d)
+    pixel_a = im_flat[idx_a]
+    pixel_b = im_flat[idx_b]
+    pixel_c = im_flat[idx_c]
+    pixel_d = im_flat[idx_d]
+
+    wa = (x1.float() - x) * (y1.float() - y)
+    wb = (x1.float() - x) * (1.0 - (y1.float() - y))
+    wc = (1.0 - (x1.float() - x)) * (y1.float() - y)
+    wd = (1.0 - (x1.float() - x)) * (1.0 - (y1.float() - y))
+    wa, wb, wc, wd = wa.unsqueeze(1), wb.unsqueeze(1), wc.unsqueeze(1), wd.unsqueeze(1)
+
+    output = wa * pixel_a + wb * pixel_b + wc * pixel_c + wd * pixel_d
+    output = output.reshape(batch_size, height, width, channels)
+    mask = mask.reshape(batch_size, height, width, 1)
+    return output, mask
+
+
+def _spatial_transformer(img, coords):
+    """A wrapper over binlinear_sampler(), taking absolute coords as input."""
+    img = img.permute(0, 2, 3, 1)  # [B, C, H, W] --> [B, H, W, C]
+    # img: [B, H, W, C]
+    # img_height = img.shape[1]
+    # img_width = img.shape[2]
+    px = coords[:, :, :, :1]  # [batch_size, height, width, 1]
+    py = coords[:, :, :, 1:]  # [batch_size, height, width, 1]
+    # Normalize coordinates to [-1, 1] to send to _bilinear_sampler.
+    # px = px / (img_width - 1) * 2.0 - 1.0  # [batch_size, height, width, 1]
+    # py = py / (img_height - 1) * 2.0 - 1.0  # [batch_size, height, width, 1]
+    output_img, mask = _bilinear_sample(img, px, py) # [B, H, W, C]
+    output_img = output_img.permute(0, 3, 1, 2)  # [B, H, W, C] --> [B, C, H, W]
+    mask = mask.permute(0, 3, 1, 2)  # [B, H, W, C] --> [B, C, H, W]
+    return output_img, mask
+
+
+def warping_with_depth(src_fea, ref_depth, src_proj, ref_proj):
+    # src_fea: [B, C, H, W]
+    # ref_depth: [B, H, W]
+    # src_proj: [B, 4, 4]
+    # ref_proj: [B, 4, 4]
+    # out: [B, C, H, W]
+
+    batch, channels = src_fea.shape[0], src_fea.shape[1]
+
+    batchsize, height, width = ref_depth.shape[0], ref_depth.shape[1], ref_depth.shape[2]
+
+    # with torch.no_grad():
+    proj = torch.matmul(src_proj, torch.inverse(ref_proj)) # Tcw
+    rot = proj[:, :3, :3]  # [B,3,3]
+    trans = proj[:, :3, 3:4]  # [B,3,1]
+
+    y, x = torch.meshgrid([torch.arange(0, height, dtype=torch.float32, device=src_fea.device),
+                           torch.arange(0, width, dtype=torch.float32, device=src_fea.device)])
+    y, x = y.contiguous(), x.contiguous()
+    y, x = y.view(height * width), x.view(height * width)
+
+    xyz = torch.stack((x, y, torch.ones_like(x)))  # [3, H*W]
+    xyz = torch.unsqueeze(xyz, 0).repeat(batch, 1, 1)  # [B, 3, H*W]
+    rot_xyz = torch.matmul(rot, xyz)  # [B, 3, H*W]
+    rot_depth_xyz = rot_xyz * ref_depth.view(batch, 1, -1)  # [B, 3, H*W]
+    proj_xyz = rot_depth_xyz + trans.view(batch, 3, 1)  # [B, 3, H*W]
+    proj_xy = proj_xyz[:, :2, :] / proj_xyz[:, 2:3, :]  # [B, 2, H*W]
+    proj_x_normalized = proj_xy[:, 0, :] / ((width - 1) / 2) - 1
+    proj_y_normalized = proj_xy[:, 1, :] / ((height - 1) / 2) - 1
+    proj_xy = torch.stack((proj_x_normalized, proj_y_normalized), dim=2)  # [B, H*W, 2]
+    grid = proj_xy
+
+    # warped_src_fea, mask = _spatial_transformer(src_fea, grid.view(batch, height, width, 2))
+
+    warped_src_fea = F.grid_sample(src_fea, grid.view(batch, height, width, 2), mode='bilinear', padding_mode='zeros')
+    warped_src_fea = warped_src_fea.view(batch, channels, height, width)
+
+    mask = torch.sum(warped_src_fea, dim=1).unsqueeze(1) != 0
+    mask = mask.repeat(1, channels, 1, 1)  # [B, 3, H, W]
+
+    return warped_src_fea, mask
+
+
+def gradient_x_depth(depth):
+    return depth[:, :, :-1, :] - depth[:, :, 1:, :]
+
+
+def gradient_y_depth(depth):
+    return depth[:, :, :, :-1] - depth[:, :, :, 1:]
+
+
+def gradient_x(img):
+    return img[:, :, :-1, :] - img[:, :, 1:, :]
+
+
+def gradient_y(img):
+    return img[:, :, :, :-1] - img[:, :, :, 1:]
+
+
+def gradient(pred):
+    D_dy = torch.zeros(pred.shape, device='cuda')  # 全0矩阵
+    D_dx = torch.zeros(pred.shape, device='cuda')  # 全0矩阵
+    D_dy[:, :, :, 1:] = pred[:, :, :, 1:] - pred[:, :, :, :-1]
+    D_dx[:, :, 1:, :] = pred[:, :, 1:, :] - pred[:, :, :-1, :]
+    return D_dx, D_dy
+
+"""
+def gradient_x(img):
+    return img[:, :, :-1, :] - img[:, :, 1:, :]
+
+
+def gradient_y(img):
+    return img[:, :-1, :, :] - img[:, 1:, :, :]
+    
+def gradient(pred):
+    D_dy = pred[:, 1:, :, :] - pred[:, :-1, :, :]
+    D_dx = pred[:, :, 1:, :] - pred[:, :, :-1, :]
+    return D_dx, D_dy
+"""
+
+class SSIM(nn.Module):
+    """Layer to compute the SSIM loss between a pair of images
+    """
+    def __init__(self):
+        super(SSIM, self).__init__()
+        self.mu_x_pool   = nn.AvgPool2d(3, 1)
+        self.mu_y_pool   = nn.AvgPool2d(3, 1)
+        self.sig_x_pool  = nn.AvgPool2d(3, 1)
+        self.sig_y_pool  = nn.AvgPool2d(3, 1)
+        self.sig_xy_pool = nn.AvgPool2d(3, 1)
+        self.mask_pool = nn.AvgPool2d(3, 1)
+        # self.refl = nn.ReflectionPad2d(1)
+
+        self.C1 = 0.01 ** 2
+        self.C2 = 0.03 ** 2
+
+    def forward(self, x, y, mask):
+        # print('mask: {}'.format(mask.shape))
+        # print('x: {}'.format(x.shape))
+        # print('y: {}'.format(y.shape))
+        # x = x.permute(0, 3, 1, 2)  # [B, H, W, C] --> [B, C, H, W]
+        # y = y.permute(0, 3, 1, 2)
+        # mask = mask.permute(0, 3, 1, 2)
+
+        # x = self.refl(x)
+        # y = self.refl(y)
+        mu_x = self.mu_x_pool(x)
+        mu_y = self.mu_y_pool(y)
+        sigma_x  = self.sig_x_pool(x ** 2) - mu_x ** 2
+        sigma_y  = self.sig_y_pool(y ** 2) - mu_y ** 2
+        sigma_xy = self.sig_xy_pool(x * y) - mu_x * mu_y
+        SSIM_n = (2 * mu_x * mu_y + self.C1) * (2 * sigma_xy + self.C2)
+        SSIM_d = (mu_x ** 2 + mu_y ** 2 + self.C1) * (sigma_x + sigma_y + self.C2)
+        SSIM_mask = self.mask_pool(mask)
+        output = SSIM_mask * torch.clamp((1 - SSIM_n / SSIM_d) / 2, 0, 1)
+        # return output.permute(0, 2, 3, 1)  # [B, C, H, W] --> [B, H, W, C]
+        return output
+
+
+def depth_smoothness(depth, img, lambda_wt=1):
+    """Computes image-aware depth smoothness loss."""
+    depth_dx = gradient_x_depth(depth)
+    depth_dy = gradient_y_depth(depth)
+    image_dx = gradient_x(img)
+    image_dy = gradient_y(img)
+    weights_x = torch.exp(-(lambda_wt * torch.mean(torch.abs(image_dx), 1, keepdim=True)))
+    weights_y = torch.exp(-(lambda_wt * torch.mean(torch.abs(image_dy), 1, keepdim=True)))
+    smoothness_x = depth_dx * weights_x
+    smoothness_y = depth_dy * weights_y
+    return torch.mean(torch.abs(smoothness_x)) + torch.mean(torch.abs(smoothness_y))
+
+
+def compute_reconstr_loss(warped, ref, mask, simple=True):
+    if simple:
+        t = torch.abs(warped * mask - ref * mask)
+        photo_loss = torch.where(t < 1, 0.5 * t ** 2, t - 0.5)
+        return photo_loss
+    else:
+        alpha = 0.5
+        ref_dx, ref_dy = gradient(ref * mask)
+        warped_dx, warped_dy = gradient(warped * mask)
+
+        grad_loss_x = torch.abs(warped_dx - ref_dx)
+        grad_loss_y = torch.abs(warped_dy - ref_dy)
+        grad_loss = grad_loss_x + grad_loss_y
+        t = torch.abs(warped * mask - ref * mask)
+        photo_loss = torch.where(t < 1, 0.5 * t ** 2, t - 0.5)
+        # photo_loss = torch.mean(photo_loss, dim=1, keepdim=True)
+
+        """photo_loss = F.smooth_l1_loss(warped * mask, ref * mask, reduction='mean')
+        grad_loss = F.smooth_l1_loss(warped_dx, ref_dx, reduction='mean') + \
+                     F.smooth_l1_loss(warped_dy, ref_dy, reduction='mean')"""
+
+        return (1 - alpha) * photo_loss + alpha * grad_loss
+
+
+class UnSupLoss(nn.Module):
+    def __init__(self):
+        super(UnSupLoss, self).__init__()
+        self.ssim = SSIM()
+        self.w_perceptual = [4, 1, 0.5]
+
+        self.reconstr_loss = 0
+        self.ssim_loss = 0
+        self.smooth_loss = 0
+        self.perceptual_loss = 0
+        # self.w_loss = [2,0.5,0.0,2]
+        self.w_loss = [12, 6, 0.0, 0.1]
+        # loss_sum = 8 * loss_photo + 2 * loss_ssim + 0.067 * loss_s
+        # loss_sum = 1.0 * loss_photo + 2 * loss_ssim + 0.02 * loss_s
+        self.w_re = self.w_loss[0]
+        self.w_ss = self.w_loss[1]
+        self.w_sm = self.w_loss[2]
+        self.w_per = self.w_loss[3]
+
+    def forward(self, depth_est, imgs, proj_matrices, outputs_feature, stage_idx, mask_photometric=None):
+
+        # imgs: [B, N, 3, H, W]
+        # depth_est: [B, H, W]
+        # src_proj: [B, 4, 4]
+        # ref_proj: [B, 4, 4]
+        # out: Loss
+        imgs = torch.unbind(imgs, 1)
+        proj_matrices = torch.unbind(proj_matrices, 1)   # 返回切片
+        assert len(imgs) == len(proj_matrices), "Different number of images and projection matrices"
+
+        batchsize, height, width = depth_est.shape[0], depth_est.shape[1], depth_est.shape[2]
+
+
+        ref_img, src_imgs = imgs[0], imgs[1:]
+        ref_proj, src_projs = proj_matrices[0], proj_matrices[1:]
+        ref_vgg_feature, src_vgg_feature = outputs_feature[0], outputs_feature[1:]
+        # print(outputs_feature[0][3-stage_idx].shape) # B*64*384*768, B*128*192*384, B*256*96*192
+        # print(outputs_feature[1][3-stage_idx].shape) # B*64*384*768, B*128*192*384, B*256*96*192
+        # print(outputs_feature[2][3-stage_idx].shape) # B*64*384*768, B*128*192*384, B*256*96*192
+
+        # ref_color = ref_img[:, :, 1::4, 1::4]  # B*C*128*160
+        ref_color = F.interpolate(ref_img, [height,  width], mode='bilinear', align_corners=False)  # False
+
+
+        self.reconstr_loss = 0
+        self.ssim_loss = 0
+        self.smooth_loss = 0
+        self.perceptual_loss = 0
+
+
+        warped_img_list = []
+        mask_list = []
+        reprojection_losses = []
+
+        ##smooth loss##
+        self.smooth_loss += depth_smoothness(depth_est.unsqueeze(dim=1), ref_color, 1.0)
+
+
+        # Loss photo & Loss ssim & loss_perpectual
+        for view in range(len(src_imgs)):
+            view_img = F.interpolate(src_imgs[view], [height, width], mode='bilinear', align_corners=False)  # False # [B, C, H, W]
+            src_proj = src_projs[view]
+            warped_img, mask = warping_with_depth(view_img, depth_est, src_proj, ref_proj) # [B, C, H, W]
+            mask = mask.float()
+
+
+            warped_img_list.append(warped_img)
+            mask_list.append(mask)
+
+            # Loss photo
+            reconstr_loss = compute_reconstr_loss(warped_img, ref_color, mask, simple=False)  # [B, C, H, W]
+            # print(reconstr_loss.shape)
+            valid_mask = 1 - mask  # replace all 0 values with INF  # [B, C, H, W]
+            # print(valid_mask.shape)
+            reprojection_losses.append(reconstr_loss + 1e4 * valid_mask)  # shape?
+            # print(reconstr_loss)
+
+            # SSIM loss
+            if view < 3:
+                # l_ssim = self.ssim(ref_img, warped_img, mask)
+                # self.ssim_loss += torch.mean(l_ssim[mask>0.5])  # torch.mean 是否合适
+                self.ssim_loss += torch.mean(self.ssim(ref_color, warped_img, mask))  # torch.mean 是否合适
+
+
+            # Loss perpectual
+            sampled_feature_src, mask_perpectual = warping_with_depth(src_vgg_feature[view][3-stage_idx], depth_est, src_proj, ref_proj)
+            # mask_perpectual = mask_perpectual.float()
+
+            if mask_photometric:
+                mask_perpectual = mask_perpectual * mask_photometric
+
+            if F.smooth_l1_loss(ref_vgg_feature[3-stage_idx][mask_perpectual], sampled_feature_src[mask_perpectual]).nelement()==0:
+                self.perceptual_loss += torch.tensor(0.)
+            else:
+                self.perceptual_loss += F.smooth_l1_loss(ref_vgg_feature[3-stage_idx][mask_perpectual], sampled_feature_src[mask_perpectual])*self.w_perceptual[3-stage_idx]
+
+
+        # top-k operates along the last dimension, so swap the axes accordingly
+        reprojection_volume = torch.stack(reprojection_losses).permute(1, 2, 3, 4, 0)  # shape [K, B, C, H, W] -> [B, C, H, W, K]
+        # print(reprojection_volume.shape)
+        # by default, it'll return top-k largest entries, hence sorted=False to get smallest entries
+        top_vals, top_inds = torch.topk(torch.neg(reprojection_volume), k=2, sorted=False) #  [B, C, H, W, K]  k=3  in original paper
+        top_vals = torch.neg(top_vals)    #  [B, C, H, W, K]
+        top_mask = top_vals < (1e4 * torch.ones_like(top_vals, device='cuda'))  #  [B, C, H, W, K]
+        # print(top_vals.shape)
+        # print(top_mask.shape)
+        top_mask = top_mask.float()
+        top_vals = torch.mul(top_vals, top_mask)  #  [B, C, H, W, K]
+
+        # top_vals = torch.sum(top_vals, dim=-1) # torch.mean 是否合适
+        # top_mask = torch.sum(top_mask, dim=-1) # torch.mean 是否合适
+        # self.reconstr_loss = torch.mean(top_vals[top_mask>0.5])) # torch.mean 是否合适
+        self.reconstr_loss = torch.mean(torch.sum(top_vals, dim=-1)) # torch.mean 是否合适
+
+
+        # total weight sum loss
+        self.loss_sum = self.w_re * self.reconstr_loss + self.w_ss * self.ssim_loss + self.w_sm * self.smooth_loss + self.w_per * self.perceptual_loss
+        # print(loss_sum, loss_photo, loss_ssim, loss_s)
+
+        return self.loss_sum, mask
+
+
+
+class SelfSupLoss(nn.Module):
+    def __init__(self):
+        super(SelfSupLoss, self).__init__()
+        self.ssim = SSIM()
+
+        self.reconstr_loss = 0
+        self.ssim_loss = 0
+        self.smooth_loss = 0
+        self.sparse_loss = 0
+        self.w_loss = [2, 1, 0.0, 10]
+        # loss_sum = 8 * loss_photo + 2 * loss_ssim + 0.067 * loss_s
+        # loss_sum = 1.0 * loss_photo + 2 * loss_ssim + 0.02 * loss_s
+        self.w_re = self.w_loss[0]
+        self.w_ss = self.w_loss[1]
+        self.w_sm = self.w_loss[2]
+        self.w_sp = self.w_loss[3]
+
+    def forward(self, depth_est, depth_gt, mask_gt, imgs, proj_matrices, stage_idx, mask_photometric=None):
+
+        # imgs: [B, N, 3, H, W]
+        # depth_est: [B, H, W]
+        # src_proj: [B, 4, 4]
+        # ref_proj: [B, 4, 4]
+        # out: Loss
+        imgs = torch.unbind(imgs, 1)
+        proj_matrices = torch.unbind(proj_matrices, 1)   # 返回切片
+        assert len(imgs) == len(proj_matrices), "Different number of images and projection matrices"
+
+        batchsize, height, width = depth_est.shape[0], depth_est.shape[1], depth_est.shape[2]
+
+
+        ref_img, src_imgs = imgs[0], imgs[1:]
+        ref_proj, src_projs = proj_matrices[0], proj_matrices[1:]
+        ref_color = F.interpolate(ref_img, [height,  width], mode='bilinear', align_corners=False)  # False
+
+        self.reconstr_loss = 0
+        self.ssim_loss = 0
+        self.smooth_loss = 0
+        self.sparse_loss = 0
+
+
+        warped_img_list = []
+        mask_list = []
+        reprojection_losses = []
+
+        ##smooth loss##
+        self.smooth_loss += depth_smoothness(depth_est.unsqueeze(dim=1), ref_color, 1.0)
+
+        ## sparse loss##
+        self.sparse_loss = F.smooth_l1_loss(depth_est[mask_gt], depth_gt[mask_gt], reduction='mean')
+
+        # Loss photo & Loss ssim
+        for view in range(len(src_imgs)):
+            view_img = F.interpolate(src_imgs[view], [height, width], mode='bilinear', align_corners=False)  # False # [B, C, H, W]
+            src_proj = src_projs[view]
+            warped_img, mask = warping_with_depth(view_img, depth_est, src_proj, ref_proj) # [B, C, H, W]
+            mask = mask.float()
+
+            warped_img_list.append(warped_img)
+            mask_list.append(mask)
+
+            # Loss photo
+            reconstr_loss = compute_reconstr_loss(warped_img, ref_color, mask, simple=False)  # [B, C, H, W]
+            # print(reconstr_loss.shape)
+            valid_mask = 1 - mask  # replace all 0 values with INF  # [B, C, H, W]
+            # print(valid_mask.shape)
+            reprojection_losses.append(reconstr_loss + 1e4 * valid_mask)  # shape?
+            # print(reconstr_loss)
+
+            # SSIM loss
+            if view < 3:
+                # l_ssim = self.ssim(ref_img, warped_img, mask)
+                # self.ssim_loss += torch.mean(l_ssim[mask>0.5])  # torch.mean 是否合适
+                self.ssim_loss += torch.mean(self.ssim(ref_color, warped_img, mask))  # torch.mean 是否合适
+
+        # top-k operates along the last dimension, so swap the axes accordingly
+        reprojection_volume = torch.stack(reprojection_losses).permute(1, 2, 3, 4, 0)  # shape [K, B, C, H, W] -> [B, C, H, W, K]
+        # print(reprojection_volume.shape)
+        # by default, it'll return top-k largest entries, hence sorted=False to get smallest entries
+        top_vals, top_inds = torch.topk(torch.neg(reprojection_volume), k=3, sorted=False) #  [B, C, H, W, K]  k=3  in original paper
+        top_vals = torch.neg(top_vals)    #  [B, C, H, W, K]
+        top_mask = top_vals < (1e4 * torch.ones_like(top_vals, device='cuda'))  #  [B, C, H, W, K]
+        # print(top_vals.shape)
+        # print(top_mask.shape)
+        top_mask = top_mask.float()
+        top_vals = torch.mul(top_vals, top_mask)  #  [B, C, H, W, K]
+
+        # top_vals = torch.sum(top_vals, dim=-1) # torch.mean 是否合适
+        # top_mask = torch.sum(top_mask, dim=-1) # torch.mean 是否合适
+        # self.reconstr_loss = torch.mean(top_vals[top_mask>0.5])) # torch.mean 是否合适
+        self.reconstr_loss = torch.mean(torch.sum(top_vals, dim=-1)) # torch.mean 是否合适
+
+        # total weight sum loss
+        self.loss_sum = self.w_re * self.reconstr_loss + self.w_ss * self.ssim_loss + self.w_sm * self.smooth_loss + self.w_sp * self.sparse_loss
+        # print(loss_sum, loss_photo, loss_ssim, loss_s)
+
+        return self.loss_sum, mask
+
+
+
+def cas_loss_unsup(inputs, images, depth_gt_ms, proj_matrices_ms, outputs_feature, **kwargs):
+
+    depth_loss_weights = kwargs.get("dlossw", None)
+    unsup_single_loss = UnSupLoss().to('cuda')
+
+
+    """total_loss_sum = torch.tensor(0.0, dtype=torch.float32, device=proj_matrices_ms["stage1"].device, requires_grad=False)
+    total_loss_s = torch.tensor(0.0, dtype=torch.float32, device=proj_matrices_ms["stage1"].device,
+                                    requires_grad=False)
+    total_loss_photo = torch.tensor(0.0, dtype=torch.float32, device=proj_matrices_ms["stage1"].device,
+                                    requires_grad=False)
+    total_loss_ssim = torch.tensor(0.0, dtype=torch.float32, device=proj_matrices_ms["stage1"].device,
+                                    requires_grad=False)"""
+
+    total_loss_sum = 0
+    total_loss_s = 0
+    total_loss_photo = 0
+    total_loss_ssim = 0
+    total_loss_perceptual = 0
+    # print(src_vgg_feature[0][0].shape) 4*64*512*640
+    # print(src_vgg_feature[0][1].shape)  4*128*256*320
+    # print(src_vgg_feature[0][2].shape)  4*256*128*160
+
+    for (stage_inputs, stage_key) in [(inputs[k], k) for k in inputs.keys() if "stage" in k]:
+
+        depth_est_stage = stage_inputs["depth"]
+        # depth_gt_stage = depth_gt_ms[stage_key]
+        mask_stage = F.interpolate(stage_inputs["photometric_confidence"].unsqueeze(1), scale_factor=[1, 1], mode='bilinear', align_corners=False)
+        mask_stage = mask_stage > 0.0
+        stage_idx = int(stage_key.replace("stage", ""))
+        proj_matrices_stage = proj_matrices_ms["stage{}".format(stage_idx)]
+
+        # outputs_feature_stage = outputs_feature[:][3-stage_idx]
+        # print(outputs_feature[0][3-stage_idx].shape) # B*64*384*768, B*128*192*384, B*256*96*192
+
+        loss_sum, mask = unsup_single_loss(depth_est_stage, images, proj_matrices_stage, outputs_feature, stage_idx, mask_photometric=None)
+        # print("sum:{:.3f}  loos_s: {:.3f}  loss_photo: {:.3f}  loss_ssim: {:.3f} loss_perceptual:{:.3f} " .format(depth_loss.detach().cpu().numpy(), loss_s.detach().cpu().numpy(), loss_photo.detach().cpu().numpy(), loss_ssim.detach().cpu().numpy(),loss_perceptual.detach().cpu().numpy() ))
+        if depth_loss_weights is not None:
+            total_loss_sum += depth_loss_weights[stage_idx - 1] * loss_sum
+            total_loss_s += depth_loss_weights[stage_idx - 1] * unsup_single_loss.smooth_loss
+            total_loss_photo += depth_loss_weights[stage_idx - 1] * unsup_single_loss.reconstr_loss
+            total_loss_ssim += depth_loss_weights[stage_idx - 1] * unsup_single_loss.ssim_loss
+            total_loss_perceptual += depth_loss_weights[stage_idx - 1] * unsup_single_loss.perceptual_loss
+        else:
+            total_loss_sum += 1.0 * loss_sum
+            total_loss_s += 1.0 *  unsup_single_loss.smooth_loss
+            total_loss_photo += 1.0 * unsup_single_loss.reconstr_loss
+            total_loss_ssim += 1.0 * unsup_single_loss.ssim_loss
+            total_loss_perceptual += 1.0 * unsup_single_loss.perceptual_loss
+        # print(total_loss_sum, depth_loss, total_loss_s, total_loss_photo, total_loss_ssim)
+
+    return total_loss_sum, loss_sum, total_loss_s, total_loss_photo, total_loss_ssim, total_loss_perceptual, mask
+
+
+def cas_loss_selfsup(inputs, depth_gt_ms, mask_ms, images, proj_matrices_ms, **kwargs):
+
+    depth_loss_weights = kwargs.get("dlossw", None)
+    selfsup_single_loss = SelfSupLoss().to('cuda')
+
+    total_loss_sum = 0
+    total_loss_s = 0
+    total_loss_photo = 0
+    total_loss_ssim = 0
+    total_loss_sparse_depth = 0
+
+
+    for (stage_inputs, stage_key) in [(inputs[k], k) for k in inputs.keys() if "stage" in k]:
+
+        depth_est_stage = stage_inputs["depth"]
+        depth_gt_stage = depth_gt_ms[stage_key]
+        mask_stage = mask_ms[stage_key]
+        mask_stage = mask_stage > 0.0
+        stage_idx = int(stage_key.replace("stage", ""))
+        proj_matrices_stage = proj_matrices_ms["stage{}".format(stage_idx)]
+
+        loss_sum, mask = selfsup_single_loss(depth_est_stage, depth_gt_stage, mask_stage, images, proj_matrices_stage, stage_idx, mask_photometric=None)
+
+        # print("sum:{:.3f}  loos_s: {:.3f}  loss_photo: {:.3f}  loss_ssim: {:.3f} loss_perceptual:{:.3f} " .format(depth_loss.detach().cpu().numpy(), loss_s.detach().cpu().numpy(), loss_photo.detach().cpu().numpy(), loss_ssim.detach().cpu().numpy(),loss_perceptual.detach().cpu().numpy() ))
+        if depth_loss_weights is not None:
+            total_loss_sum += depth_loss_weights[stage_idx - 1] * loss_sum
+            total_loss_s += depth_loss_weights[stage_idx - 1] * selfsup_single_loss.smooth_loss
+            total_loss_photo += depth_loss_weights[stage_idx - 1] * selfsup_single_loss.reconstr_loss
+            total_loss_ssim += depth_loss_weights[stage_idx - 1] * selfsup_single_loss.ssim_loss
+            total_loss_sparse_depth += depth_loss_weights[stage_idx - 1] * selfsup_single_loss.sparse_loss
+        else:
+            total_loss_sum += 1.0 * loss_sum
+            total_loss_s += 1.0 *  selfsup_single_loss.smooth_loss
+            total_loss_photo += 1.0 * selfsup_single_loss.reconstr_loss
+            total_loss_ssim += 1.0 * selfsup_single_loss.ssim_loss
+            total_loss_sparse_depth += 1.0 * selfsup_single_loss.sparse_loss
+        # print(total_loss_sum, depth_loss, total_loss_s, total_loss_photo, total_loss_ssim)
+
+    return total_loss_sum, loss_sum, total_loss_s, total_loss_photo, total_loss_ssim, total_loss_sparse_depth, mask
+
+
+def cas_loss_gt(inputs, depth_gt_ms, mask_ms, **kwargs):
+    depth_loss_weights = kwargs.get("dlossw", None)
+
+    total_loss = torch.tensor(0.0, dtype=torch.float32, device=mask_ms["stage1"].device, requires_grad=False)
+
+    for (stage_inputs, stage_key) in [(inputs[k], k) for k in inputs.keys() if "stage" in k]:
+        depth_est = stage_inputs["depth"]
+        depth_gt = depth_gt_ms[stage_key]
+        mask = mask_ms[stage_key]
+        mask = mask > 0.5
+
+        depth_loss = F.smooth_l1_loss(depth_est[mask], depth_gt[mask], reduction='mean')
+
+        if depth_loss_weights is not None:
+            stage_idx = int(stage_key.replace("stage", "")) - 1
+            total_loss += depth_loss_weights[stage_idx] * depth_loss
+        else:
+            total_loss += 1.0 * depth_loss
+
+    return total_loss, depth_loss
+
+
+def compute_3dpts_batch(pts, intrinsics):
+    pts_shape = pts.shape  # 4*128*160
+    batchsize = pts_shape[0]
+    height = pts_shape[1]
+    width = pts_shape[2]
+
+    y_ref, x_ref = torch.meshgrid([torch.arange(0, height, dtype=torch.float32, device=pts.device),
+                                   torch.arange(0, width, dtype=torch.float32, device=pts.device)])
+
+    y_ref, x_ref = y_ref.contiguous(), x_ref.contiguous()
+    y_ref, x_ref = y_ref.view(height * width), x_ref.view(height * width)
+
+    xyz_ref = torch.matmul(torch.inverse(intrinsics),
+                           torch.stack((x_ref, y_ref, torch.ones_like(x_ref))).unsqueeze(0) * pts.view(batchsize,
+                                                                                                       -1).unsqueeze(1))
+
+    xyz_ref = xyz_ref.view(batchsize, 3, height, width)
+    xyz_ref = xyz_ref.permute(0, 2, 3, 1)
+
+    return xyz_ref
+
+
+def compute_normal_by_depth(depth_est, ref_intrinsics, nei):
+    ## mask is used to filter the background with infinite depth
+    # mask = tf.greater(depth_map, tf.zeros(depth_map.get_shape().as_list())) #我这里好像不存在depth<0的点
+
+    # kitti_shape = depth_map.get_shape().as_list()
+    depth_est_shape = depth_est.shape  # 4*128*160
+    batchsize = depth_est_shape[0]
+    height = depth_est_shape[1]
+    width = depth_est_shape[2]
+
+    pts_3d_map = compute_3dpts_batch(depth_est, ref_intrinsics)  # 4*128*160*3
+    pts_3d_map = pts_3d_map.contiguous()
+
+    ## shift the 3d pts map by nei along 8 directions
+    pts_3d_map_ctr = pts_3d_map[:, nei:-nei, nei:-nei, :]
+    pts_3d_map_x0 = pts_3d_map[:, nei:-nei, 0:-(2 * nei), :]
+    pts_3d_map_y0 = pts_3d_map[:, 0:-(2 * nei), nei:-nei, :]
+    pts_3d_map_x1 = pts_3d_map[:, nei:-nei, 2 * nei:, :]
+    pts_3d_map_y1 = pts_3d_map[:, 2 * nei:, nei:-nei, :]
+    pts_3d_map_x0y0 = pts_3d_map[:, 0:-(2 * nei), 0:-(2 * nei), :]
+    pts_3d_map_x0y1 = pts_3d_map[:, 2 * nei:, 0:-(2 * nei), :]
+    pts_3d_map_x1y0 = pts_3d_map[:, 0:-(2 * nei), 2 * nei:, :]
+    pts_3d_map_x1y1 = pts_3d_map[:, 2 * nei:, 2 * nei:, :]
+
+    ## generate difference between the central pixel and one of 8 neighboring pixels
+    diff_x0 = pts_3d_map_ctr - pts_3d_map_x0  # 因为是求向量，所以不用除以相邻两点之间的距离
+    diff_x1 = pts_3d_map_ctr - pts_3d_map_x1
+    diff_y0 = pts_3d_map_y0 - pts_3d_map_ctr
+    diff_y1 = pts_3d_map_y1 - pts_3d_map_ctr
+    diff_x0y0 = pts_3d_map_x0y0 - pts_3d_map_ctr
+    diff_x0y1 = pts_3d_map_ctr - pts_3d_map_x0y1
+    diff_x1y0 = pts_3d_map_x1y0 - pts_3d_map_ctr
+    diff_x1y1 = pts_3d_map_ctr - pts_3d_map_x1y1
+
+    ## flatten the diff to a #pixle by 3 matrix
+    # pix_num = kitti_shape[0] * (kitti_shape[1]-2*nei) * (kitti_shape[2]-2*nei)
+    pix_num = batchsize * (height - 2 * nei) * (width - 2 * nei)
+    # print(pix_num)
+    # print(diff_x0.shape)
+    diff_x0 = diff_x0.view(pix_num, 3)
+    diff_y0 = diff_y0.view(pix_num, 3)
+    diff_x1 = diff_x1.view(pix_num, 3)
+    diff_y1 = diff_y1.view(pix_num, 3)
+    diff_x0y0 = diff_x0y0.view(pix_num, 3)
+    diff_x0y1 = diff_x0y1.view(pix_num, 3)
+    diff_x1y0 = diff_x1y0.view(pix_num, 3)
+    diff_x1y1 = diff_x1y1.view(pix_num, 3)
+
+    ## calculate normal by cross product of two vectors
+    normals0 = F.normalize(torch.cross(diff_x1, diff_y1))  # * tf.tile(normals0_mask[:, None], [1,3]) tf.tile=.repeat
+    normals1 = F.normalize(torch.cross(diff_x0, diff_y0))  # * tf.tile(normals1_mask[:, None], [1,3])
+    normals2 = F.normalize(torch.cross(diff_x0y1, diff_x0y0))  # * tf.tile(normals2_mask[:, None], [1,3])
+    normals3 = F.normalize(torch.cross(diff_x1y0, diff_x1y1))  # * tf.tile(normals3_mask[:, None], [1,3])
+
+    normal_vector = normals0 + normals1 + normals2 + normals3
+    # normal_vector = tf.reduce_sum(tf.concat([[normals0], [normals1], [normals2], [normals3]], 0),0)
+    # normal_vector = F.normalize(normals0)
+    normal_vector = F.normalize(normal_vector)
+    # normal_map = tf.reshape(tf.squeeze(normal_vector), [kitti_shape[0]]+[kitti_shape[1]-2*nei]+[kitti_shape[2]-2*nei]+[3])
+    normal_map = normal_vector.view(batchsize, height - 2 * nei, width - 2 * nei, 3)
+
+    # 对于depth小于0的点，不计算normal
+    # normal_map *= tf.tile(tf.expand_dims(tf.cast(mask[:, nei:-nei, nei:-nei], tf.float32), -1), [1,1,1,3])
+
+    # normal_map = tf.pad(normal_map, [[0,0], [nei, nei], [nei, nei], [0,0]] ,"CONSTANT")
+    normal_map = F.pad(normal_map, (0, 0, nei, nei, nei, nei), "constant", 0)
+
+    # print(normal_map.shape) #4*128*160*3
+    # print(normal_map[0,:,:,0])
+
+    return normal_map
+
+
+def compute_depth_by_normal(depth_map, normal_map, intrinsics, tgt_image, nei=1):
+    depth_init = depth_map.clone()
+
+    d2n_nei = 1  # normal_depth转化的时候的空边
+    depth_map = depth_map[:, d2n_nei:-(d2n_nei), d2n_nei:-(d2n_nei)]
+    normal_map = normal_map[:, d2n_nei:-(d2n_nei), d2n_nei:-(d2n_nei), :]
+
+    # depth_dims = depth_map.get_shape().as_list()
+    depth_map_shape = depth_map.shape
+    batchsize = depth_map_shape[0]  # 4
+    height = depth_map_shape[1]  # 126
+    width = depth_map_shape[2]  # 158
+
+    # x_coor = tf.range(nei, depth_dims[2]+nei)
+    # y_coor = tf.range(nei, depth_dims[1]+nei)
+    # x_ctr, y_ctr = tf.meshgrid(x_coor, y_coor)
+    y_ctr, x_ctr = torch.meshgrid(
+        [torch.arange(d2n_nei, height + d2n_nei, dtype=torch.float32, device=normal_map.device),
+         torch.arange(d2n_nei, width + d2n_nei, dtype=torch.float32, device=normal_map.device)])
+    y_ctr, x_ctr = y_ctr.contiguous(), x_ctr.contiguous()
+
+    # x_ctr = tf.cast(x_ctr, tf.float32)
+    # y_ctr = tf.cast(y_ctr, tf.float32)
+    # x_ctr_tile = tf.tile(tf.expand_dims(x_ctr, 0), [depth_dims[0], 1, 1])
+    # y_ctr_tile = tf.tile(tf.expand_dims(y_ctr, 0), [depth_dims[0], 1, 1])
+    x_ctr_tile = x_ctr.unsqueeze(0).repeat(batchsize, 1, 1)  # B*height*width
+    y_ctr_tile = y_ctr.unsqueeze(0).repeat(batchsize, 1, 1)
+
+    x0 = x_ctr_tile - d2n_nei
+    y0 = y_ctr_tile - d2n_nei
+    x1 = x_ctr_tile + d2n_nei
+    y1 = y_ctr_tile + d2n_nei
+    normal_x = normal_map[:, :, :, 0]
+    normal_y = normal_map[:, :, :, 1]
+    normal_z = normal_map[:, :, :, 2]
+
+    # fx, fy, cx, cy = intrinsics[:,0], intrinsics[:,1], intrinsics[:,2], intrinsics[:,3]
+    fx, fy, cx, cy = intrinsics[:, 0, 0], intrinsics[:, 1, 1], intrinsics[:, 0, 2], intrinsics[:, 1, 2]
+    cx_tile = cx.unsqueeze(-1).unsqueeze(-1).repeat(1, height, width)
+    cy_tile = cy.unsqueeze(-1).unsqueeze(-1).repeat(1, height, width)
+    fx_tile = fx.unsqueeze(-1).unsqueeze(-1).repeat(1, height, width)
+    fy_tile = fy.unsqueeze(-1).unsqueeze(-1).repeat(1, height, width)
+
+    numerator = (x_ctr_tile - cx_tile) / fx_tile * normal_x + (y_ctr_tile - cy_tile) / fy_tile * normal_y + normal_z
+    denominator_x0 = (x0 - cx_tile) / fx_tile * normal_x + (y_ctr_tile - cy_tile) / fy_tile * normal_y + normal_z
+    denominator_y0 = (x_ctr_tile - cx_tile) / fx_tile * normal_x + (y0 - cy_tile) / fy_tile * normal_y + normal_z
+    denominator_x1 = (x1 - cx_tile) / fx_tile * normal_x + (y_ctr_tile - cy_tile) / fy_tile * normal_y + normal_z
+    denominator_y1 = (x_ctr_tile - cx_tile) / fx_tile * normal_x + (y1 - cy_tile) / fy_tile * normal_y + normal_z
+    denominator_x0y0 = (x0 - cx_tile) / fx_tile * normal_x + (y0 - cy_tile) / fy_tile * normal_y + normal_z
+    denominator_x0y1 = (x0 - cx_tile) / fx_tile * normal_x + (y1 - cy_tile) / fy_tile * normal_y + normal_z
+    denominator_x1y0 = (x1 - cx_tile) / fx_tile * normal_x + (y0 - cy_tile) / fy_tile * normal_y + normal_z
+    denominator_x1y1 = (x1 - cx_tile) / fx_tile * normal_x + (y1 - cy_tile) / fy_tile * normal_y + normal_z
+
+    mask_x0 = denominator_x0 == 0
+    denominator_x0 = denominator_x0 + 1e-3 * mask_x0.float()
+    mask_y0 = denominator_y0 == 0
+    denominator_y0 = denominator_y0 + 1e-3 * mask_y0.float()
+    mask_x1 = denominator_x1 == 0
+    denominator_x1 = denominator_x1 + 1e-3 * mask_x1.float()
+    mask_y1 = denominator_y1 == 0
+    denominator_y1 = denominator_y1 + 1e-3 * mask_y1.float()
+    mask_x0y0 = denominator_x0y0 == 0
+    denominator_x0y0 = denominator_x0y0 + 1e-3 * mask_x0y0.float()
+    mask_x0y1 = denominator_x0y1 == 0
+    denominator_x0y1 = denominator_x0y1 + 1e-3 * mask_x0y1.float()
+    mask_x1y0 = denominator_x1y0 == 0
+    denominator_x1y0 = denominator_x1y0 + 1e-3 * mask_x1y0.float()
+    mask_x1y1 = denominator_x1y1 == 0
+    denominator_x1y1 = denominator_x1y1 + 1e-3 * mask_x1y1.float()
+
+    depth_map_x0 = numerator / denominator_x0 * depth_map
+    depth_map_y0 = numerator / denominator_y0 * depth_map
+    depth_map_x1 = numerator / denominator_y0 * depth_map
+    depth_map_y1 = numerator / denominator_y0 * depth_map
+    depth_map_x0y0 = numerator / denominator_x0y0 * depth_map
+    depth_map_x0y1 = numerator / denominator_x0y1 * depth_map
+    depth_map_x1y0 = numerator / denominator_x1y0 * depth_map
+    depth_map_x1y1 = numerator / denominator_x1y1 * depth_map
+
+    # print(depth_map_x0.shape) #4*126*158
+
+    depth_x0 = depth_init
+    depth_x0[:, d2n_nei:-(d2n_nei), :-(2 * d2n_nei)] = depth_map_x0
+    depth_y0 = depth_init
+    depth_y0[:, 0:-(2 * d2n_nei), d2n_nei:-(d2n_nei)] = depth_map_y0
+    depth_x1 = depth_init
+    depth_x1[:, d2n_nei:-(d2n_nei), 2 * d2n_nei:] = depth_map_x1
+    depth_y1 = depth_init
+    depth_y1[:, 2 * d2n_nei:, d2n_nei:-(d2n_nei)] = depth_map_y1
+    depth_x0y0 = depth_init
+    depth_x0y0[:, 0:-(2 * d2n_nei), 0:-(2 * d2n_nei)] = depth_map_x0y0
+    depth_x1y0 = depth_init
+    depth_x1y0[:, 0:-(2 * d2n_nei), 2 * d2n_nei:] = depth_map_x1y0
+    depth_x0y1 = depth_init
+    depth_x0y1[:, 2 * d2n_nei:, 0:-(2 * d2n_nei)] = depth_map_x0y1
+    depth_x1y1 = depth_init
+    depth_x1y1[:, 2 * d2n_nei:, 2 * d2n_nei:] = depth_map_x1y1
+
+    # --------------------计算权重--------------------------
+    tgt_image = tgt_image.permute(0, 2, 3, 1)
+    tgt_image = tgt_image.contiguous()  # 4*128*160*3
+
+    # print(depth_map_x0.shape)  #4*124*156
+    # normal_map = F.pad(normal_map,(0,0,nei,nei,nei,nei),"constant", 0)
+
+    img_grad_x0 = tgt_image[:, d2n_nei:-d2n_nei, :-2 * d2n_nei, :] - tgt_image[:, d2n_nei:-d2n_nei, d2n_nei:-d2n_nei, :]
+    # print(img_grad_x0.shape) #4*126*158*3
+    img_grad_x0 = F.pad(img_grad_x0, (0, 0, 0, 2 * d2n_nei, d2n_nei, d2n_nei), "constant", 1e-3)
+    img_grad_y0 = tgt_image[:, :-2 * d2n_nei, d2n_nei:-d2n_nei, :] - tgt_image[:, d2n_nei:-d2n_nei, d2n_nei:-d2n_nei, :]
+    img_grad_y0 = F.pad(img_grad_y0, (0, 0, d2n_nei, d2n_nei, 0, 2 * d2n_nei), "constant", 1e-3)
+    img_grad_x1 = tgt_image[:, d2n_nei:-d2n_nei, 2 * d2n_nei:, :] - tgt_image[:, d2n_nei:-d2n_nei, d2n_nei:-d2n_nei, :]
+    img_grad_x1 = F.pad(img_grad_x1, (0, 0, 2 * d2n_nei, 0, d2n_nei, d2n_nei), "constant", 1e-3)
+    img_grad_y1 = tgt_image[:, 2 * d2n_nei:, d2n_nei:-d2n_nei, :] - tgt_image[:, d2n_nei:-d2n_nei, d2n_nei:-d2n_nei, :]
+    img_grad_y1 = F.pad(img_grad_y1, (0, 0, d2n_nei, d2n_nei, 2 * d2n_nei, 0), "constant", 1e-3)
+
+    img_grad_x0y0 = tgt_image[:, :-2 * d2n_nei, :-2 * d2n_nei, :] - tgt_image[:, d2n_nei:-d2n_nei, d2n_nei:-d2n_nei, :]
+    img_grad_x0y0 = F.pad(img_grad_x0y0, (0, 0, 0, 2 * d2n_nei, 0, 2 * d2n_nei), "constant", 1e-3)
+    img_grad_x1y0 = tgt_image[:, :-2 * d2n_nei, 2 * d2n_nei:, :] - tgt_image[:, d2n_nei:-d2n_nei, d2n_nei:-d2n_nei, :]
+    img_grad_x1y0 = F.pad(img_grad_x1y0, (0, 0, 2 * d2n_nei, 0, 0, 2 * d2n_nei), "constant", 1e-3)
+    img_grad_x0y1 = tgt_image[:, 2 * d2n_nei:, :-2 * d2n_nei, :] - tgt_image[:, d2n_nei:-d2n_nei, d2n_nei:-d2n_nei, :]
+    img_grad_x0y1 = F.pad(img_grad_x0y1, (0, 0, 0, 2 * d2n_nei, 2 * d2n_nei, 0), "constant", 1e-3)
+    img_grad_x1y1 = tgt_image[:, 2 * d2n_nei:, 2 * d2n_nei:, :] - tgt_image[:, d2n_nei:-d2n_nei, d2n_nei:-d2n_nei, :]
+    img_grad_x1y1 = F.pad(img_grad_x1y1, (0, 0, 2 * d2n_nei, 0, 2 * d2n_nei, 0), "constant", 1e-3)
+
+    # print(img_grad_x0.shape) #4*128*160*3
+
+    alpha = 0.1
+    weights_x0 = torch.exp(-1 * alpha * torch.mean(torch.abs(img_grad_x0), 3))
+    weights_y0 = torch.exp(-1 * alpha * torch.mean(torch.abs(img_grad_y0), 3))
+    weights_x1 = torch.exp(-1 * alpha * torch.mean(torch.abs(img_grad_x1), 3))
+    weights_y1 = torch.exp(-1 * alpha * torch.mean(torch.abs(img_grad_y1), 3))
+
+    weights_x0y0 = torch.exp(-1 * alpha * torch.mean(torch.abs(img_grad_x0y0), 3))
+    weights_x1y0 = torch.exp(-1 * alpha * torch.mean(torch.abs(img_grad_x1y0), 3))
+    weights_x0y1 = torch.exp(-1 * alpha * torch.mean(torch.abs(img_grad_x0y1), 3))
+    weights_x1y1 = torch.exp(-1 * alpha * torch.mean(torch.abs(img_grad_x1y1), 3))
+
+    # print(weights_x0.shape)    #4*128*160
+    weights_sum = torch.sum(torch.stack(
+        (weights_x0, weights_y0, weights_x1, weights_y1, weights_x0y0, weights_x1y0, weights_x0y1, weights_x1y1), 0), 0)
+
+    # print(weights.shape) 4*128*160
+    weights = torch.stack(
+        (weights_x0, weights_y0, weights_x1, weights_y1, weights_x0y0, weights_x1y0, weights_x0y1, weights_x1y1),
+        0) / weights_sum
+    depth_map_avg = torch.sum(
+        torch.stack((depth_x0, depth_y0, depth_x1, depth_y1, depth_x0y0, depth_x1y0, depth_x0y1, depth_x1y1),
+                    0) * weights, 0)
+
+    return depth_map_avg
+
