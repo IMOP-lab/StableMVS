@@ -1,4 +1,4 @@
 # StableMVS
 StableMVS for NIPS 2025
 
-code will bepeovided soon
+Most of the code has been provided, and the weighting and training process will be refined soon
