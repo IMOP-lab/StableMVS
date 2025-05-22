@@ -119,4 +119,3 @@ For questions during the review process, please raise an issue in this repositor
 
 ---
 
-是否为你填充一个带默认占位信息的实际 `README.md` 文件？或者是否需要 `.tex` 格式一并生成？
