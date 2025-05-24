@@ -1,6 +1,6 @@
 # StableMVS: Diffusion-Propelled Stable Multi-View Stereo via Epistemic and Morphological Priors for Urban Depth Ambiguity
 
-*NIPS 2025*  
+
 **[Anonymous Project Page](https://anonymous.4open.science/r/StableMVS)**  
 
 ---
