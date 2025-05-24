@@ -82,7 +82,7 @@ python try.py
 | AggrMVS        | 0.153       | --           | --           | --           | --         | --         | 97.00      | 97.96       |
 | **StableMVS**  | **0.128**   | **0.25**     | **0.342**    | **0.273**    | **62.20**  | **94.00**  | **98.20**  | **98.97**   |
 
-> _Note_: Underscores indicate second-best results. Bold indicates best results.
+
 
 
 
@@ -104,7 +104,6 @@ Comparison results of different methods on the BlendedMVS dataset. **StableMVS r
 | ARAI-MVSNet      | 0.67    | _7.91_     | _2.95_     |
 | **StableMVS**    | **0.55**| **7.66**   | **2.93**   |
 
-> _Note_: Underscores `_..._` indicate second-best results; bold `**...**` indicates best results.
 
 
 
