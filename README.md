@@ -21,12 +21,12 @@ This repository contains the official implementation of **StableMVS**, a robust 
 
 ## Overview
 
-![Overview](./img/overall.jpg)
+![Overview](./img/overall.png)
 
 ---
 ## Qualitative result
 
-![Overview](./img/whu_mhun.jpg)
+![Overview](./img/whu_mhun.png)
 
 ---
 ## Installation
