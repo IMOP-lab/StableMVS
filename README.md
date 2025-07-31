@@ -21,7 +21,7 @@ This repository contains the official implementation of **StableMVS**, a robust 
 
 ## Overview
 
-![Overview](./img/overall_new.jpg)
+![Overview](./img/overall.jpg)
 
 ---
 ## Qualitative result
