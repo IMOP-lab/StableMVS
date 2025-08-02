@@ -1,5 +1,4 @@
-# StableMVS: Diffusion-Propelled Stable Multi-View Stereo via Epistemic and Morphological Priors for Urban Depth Ambiguity
-
+# Diffusion-Driven Multi-View Depth Estimation with Epistemic and Morphological Priors for Urban Scene Reconstruction
 
 **[Anonymous Project Page](https://anonymous.4open.science/r/StableMVS)**  
 
@@ -21,12 +20,12 @@ This repository contains the official implementation of **StableMVS**, a robust 
 
 ## Overview
 
-![Overview](./img/overall.png)
+![Overview](./img/overall.jpg)
 
 ---
 ## Qualitative result
 
-![Overview](./img/whu_mhun.png)
+![Overview](./img/whu_mhun.jpg)
 
 ---
 ## Installation
