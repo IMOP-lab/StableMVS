@@ -8,34 +8,6 @@ import matplotlib.pyplot as plt
 Align_Corners_Range = False
 
 
-# class ChannelAttention(nn.Module):
-#     def __init__(self, in_channels, reduction=16):
-#         super(ChannelAttention, self).__init__()
-#         self.fc1 = nn.Linear(in_channels, in_channels // reduction)
-#         self.fc2 = nn.Linear(in_channels // reduction, in_channels)
-#         self.relu = nn.ReLU()
-#         self.sigmoid = nn.Sigmoid()
-
-#     def forward(self, x):
-#         squeezed = torch.mean(x, dim=[2, 3, 4])
-#         weights = self.fc2(self.relu(self.fc1(squeezed)))
-#         weights = self.sigmoid(weights)
-#         return x * weights.view(*weights.shape, 1, 1, 1)
-
-# # 定义特征融合模块
-# class FeatureFusion(nn.Module):
-#     def __init__(self, total_channels, reduction=16):
-#         super(FeatureFusion, self).__init__()
-#         self.ca = ChannelAttention(total_channels, reduction)
-
-#     def forward(self, feature1, feature2):
-#         assert feature1.shape[2:] == feature2.shape[2:], \
-#             f"空间维度必须对齐: {feature1.shape[2:]} != {feature2.shape[2:]}"
-#         concatenated = torch.cat((feature1, feature2), dim=1)
-#         fused_feature = self.ca(concatenated)
-#         return fused_feature
-
-
 def cas_mvsnet_loss(inputs, depth_gt_ms, mask_ms, **kwargs):
     depth_loss_weights = kwargs.get("dlossw", None)
 
@@ -74,19 +46,9 @@ def cas_mvsnet_loss(inputs, depth_gt_ms, mask_ms, **kwargs):
 
         depth_loss = F.smooth_l1_loss(depth_est[mask], depth_gt[mask], reduction='mean')
 
-        # print(depth_loss)
-        # depth_max = prob_volume.shape[1]
-        #
         # prob_loss = Adaptive_Multi_Modal_Cross_Entropy_Loss(depth_est, depth_gt, mask, int(depth_max)) #+ depth_loss
         diffusion_loss = stage_inputs["diffusion_loss"]
         # print(diffusion_loss)
-
-        # depth_loss = depth_loss
-
-        # print(depth_loss)
-        # print("-------------------------------------------------------")
-
-
 
         if depth_loss_weights is not None:
             stage_idx = int(stage_key.replace("stage", "")) - 1
@@ -107,80 +69,6 @@ def cas_mvsnet_loss(inputs, depth_gt_ms, mask_ms, **kwargs):
     return total_loss, depth_loss1
     # return total_loss, depth_loss1
 
-    # return total_loss, depth_loss, depth_loss1
-
-
-# def cas_mvsnet_loss(inputs, depth_gt_ms, mask_ms, **kwargs):
-#     depth_loss_weights = kwargs.get("dlossw", None)
-
-#     total_loss = torch.tensor(0.0, dtype=torch.float32, device=mask_ms["stage1"].device, requires_grad=False)
-
-#     for (stage_inputs, stage_key) in [(inputs[k], k) for k in inputs.keys() if "stage" in k]:
-#         # print(stage_key)
-
-
-#         if stage_key == "stage3":
-#             # print(inputs["refined_depth"].shape)
-
-#             depth_est =inputs["refined_depth"]
-#             depth_est1 =inputs["refined_depth"]
-#         else:
-#             # print(stage_inputs["depth"].shape)
-
-#             depth_est = stage_inputs["depth"]
-
-
-#         # depth_est = stage_inputs["depth"]
-#         # depth_est1 = inputs["refined_depth"]
-#         # depth_est = stage_inputs["refined_depth"]
-
-#         prob_volume = stage_inputs["prob_volume"]
-
-
-#         depth_gt = depth_gt_ms[stage_key]
-#         mask = mask_ms[stage_key]
-#         mask = mask > 0.5
-
-#         # min_val = depth_gt[mask].min().item()
-#         # depth_max = depth_gt[mask].max().item()
-#         # print(f"depth_gt 范围: min={min_val}, max={max_val}")
-
-
-#         depth_loss = F.smooth_l1_loss(depth_est[mask], depth_gt[mask], reduction='mean')
-
-#         # print(depth_loss)
-#         # depth_max = prob_volume.shape[1]
-#         #
-#         # prob_loss = Adaptive_Multi_Modal_Cross_Entropy_Loss(depth_est, depth_gt, mask, int(depth_max)) #+ depth_loss
-#         diffusion_loss = stage_inputs["diffusion_loss"]
-#         # print(diffusion_loss)
-
-#         # depth_loss = depth_loss
-
-#         # print(depth_loss)
-#         # print("-------------------------------------------------------")
-
-#         if depth_loss_weights is not None:
-#             stage_idx = int(stage_key.replace("stage", "")) - 1
-#             total_loss += depth_loss_weights[stage_idx] * depth_loss
-#             # total_loss += depth_loss_weights[stage_idx] * diffusion_loss*0.1`
-#         else:
-#             total_loss += 1.0 * depth_loss
-
-#         if stage_key == "stage3":
-#             depth_loss1 = F.smooth_l1_loss(depth_est1[mask], depth_gt[mask], reduction='mean')
-
-#         # print(inputs["refined_depth"].shape)
-
-
-
-#     return total_loss, depth_loss1
-
-#     # return total_loss, depth_loss, depth_loss1
-
-
-
-
 # from __future__ import print_function
 import torch
 import torch.nn as nn
@@ -189,66 +77,6 @@ import torch.utils.data
 import torch.nn.functional as F
 # import math
 # import numpy as np
-
-
-
-
-# import torchvision.utils as vutils
-# import os
-# import matplotlib.cm as cm
-# from PIL import Image
-# # 定义归一化函数
-# def normalize_feature_map(feature_map):
-#     feature_map_min = feature_map.min()
-#     feature_map_max = feature_map.max()
-#     if feature_map_max > feature_map_min:
-#         return (feature_map - feature_map_min) / (feature_map_max - feature_map_min)
-#     else:
-#         return feature_map - feature_map_min
-
-# # 定义最大值融合并保存为彩色图的函数
-# def save_fused_val_map(features, layer_name):
-#     # 确保特征图是 CPU 张量
-#     if features.is_cuda:
-#         features = features.cpu()
-    
-#     # 检查并去掉 batch 维度
-#     if features.dim() == 4 and features.shape[0] == 1:
-#         features = features.squeeze(0)  # 从 (1, C, H, W) 变为 (C, H, W)
-#     elif features.dim() != 3:
-#         raise ValueError(f"Expected features to have 3 dims (C, H, W) or 4 dims with batch=1, got {features.shape}")
-    
-
-#     layer_name = str(features.shape[0])
-#     print(layer_name)
-#     # 沿着通道维度取最大值，得到 (H, W)
-#     fused_feature = torch.max(features, dim=0)[0]
-#     # weights = torch.ones(features.shape[0]) / features.shape[0]  # 均匀权重
-#     # fused_feature = torch.sum(features * weights.view(-1, 1, 1), dim=0)
-
-#     # fused_feature = features[0]  # 只取第 0 个通道
-#     # 归一化融合后的特征图
-#     normalized_feature = normalize_feature_map(fused_feature)
-    
-#     # 转换为 numpy 数组
-#     feature_np = normalized_feature.numpy()
-    
-#     # 使用颜色映射转换为 RGB 图像
-#     colormap = cm.get_cmap('viridis')  # 可选：'jet', 'plasma', 'magma' 等
-#     colored_feature = colormap(feature_np)  # 输出形状 (H, W, 4)，RGBA 格式
-    
-#     # 去掉 Alpha 通道，仅保留 RGB，形状变为 (H, W, 3)
-#     colored_feature_rgb = colored_feature[:, :, :3]
-    
-#     # 转换为 0-255 范围的 uint8 类型
-#     colored_feature_rgb = (colored_feature_rgb * 255).astype(np.uint8)
-    
-#     # 直接保存为 JPG 图像，不使用 matplotlib
-#     Image.fromarray(colored_feature_rgb).save(f'{layer_name}_fused_feature_color.jpg')
-
-
-
-
 
 
 
@@ -530,65 +358,6 @@ class DepthNet(nn.Module):
         # volume_variance = self.fusion(volume_variance, deps_variance)
 
 
-        # if stage_idx == 0:
-        #     volume_variance =  self.fusion1(volume_variance, deps_variance)  # 第一组
-        # elif stage_idx == 1:
-        #     volume_variance =  self.fusion2(volume_variance, deps_variance)  # 第二组
-        # elif stage_idx == 2:
-        #     volume_variance =  self.fusion3(volume_variance, deps_variance)  # 第三组
-
-
-
-        # print(volume_variance.shape)
-        # print(volume_variance.shape)
-        # print(deps_variance.shape)
-
-        # volume_variance = deps_variance
-
-
-        # step 3. cost volume regularization
-
-
-
-
-        # num_diffusion_steps =1
-        # noise_scale = torch.linspace(1.0, 0.1, num_diffusion_steps)  # 定义噪声尺度，逐步减小
-        # for step in range(num_diffusion_steps):
-        #     noise = torch.randn_like(volume_variance) * noise_scale[step]
-        #
-        #     volume_variance = volume_variance + noise  # 添加噪声
-        #
-        #     # t = torch.tensor step.to(volume_variance.device)  # 随机时间步 (假设时间步在0到99之间)
-        #     t = torch.tensor(step, device=volume_variance.device)
-        #
-        #     volume_variance = cost_regularization(volume_variance, t, step)
-
-        # cost_reg = cost_regularization(volume_variance)
-
-
-
-        # if stage_idx == 2:
-        #     if self.training:
-        #         num_diffusion_steps = 50
-        #         noise_scale = torch.linspace(1.0, 0, num_diffusion_steps)  # 定义噪声尺度，逐步减小
-        #     else:
-        #         num_diffusion_steps = 4
-        #         noise_scale = torch.linspace(1.0, 0, num_diffusion_steps)  # 定义噪声尺度，逐步减小
-        #     for step in range(num_diffusion_steps):
-        #         with torch.no_grad():
-        #             noise = torch.randn_like(volume_variance) * noise_scale[step]
-        #             volume_variance = volume_variance + noise  # 添加噪声
-        #             del noise
-        #
-        #         # volume_variance = volume_variance +  torch.randn_like(volume_variance) * noise_scale[step]  # 添加噪声
-        #         # t = torch.tensor step.to(volume_variance.device)  # 随机时间步 (假设时间步在0到99之间)
-        #             t = torch.tensor(step, device=volume_variance.device)
-        #
-        #         volume_variance = cost_regularization(volume_variance, t, step, num_diffusion_steps)
-        #     cost_reg = volume_variance
-        # else:
-        #     cost_reg = cost_regularization(volume_variance)
-
         # cost_reg = volume_variance
         cost_reg,diffusion_loss = cost_regularization(volume_variance)
 
@@ -605,22 +374,7 @@ class DepthNet(nn.Module):
 
         depth = depth_regression(prob_volume, depth_values=depth_values)
 
-        # print(depth.shape)
-
-        # print(depth_values)
-
-
-        # with torch.no_grad():
-        #     # photometric confidence
-        #     prob_volume_sum4 = 4 * F.avg_pool3d(F.pad(prob_volume.unsqueeze(1), pad=(0, 0, 0, 0, 1, 2)), (4, 1, 1), stride=1, padding=0).squeeze(1)
-        #     depth_index = depth_regression(prob_volume, depth_values=torch.arange(num_depth, device=prob_volume.device, dtype=torch.float)).long()
-        #     # depth_index = depth_index.clamp(min=0, max=num_depth-1)
-        #     depth_index = depth_index.clamp(min=0, max=num_depth-1)
-        #
-        #     # print(f"depth_index range: [{depth_index.min()}, {depth_index.max()}]")
-        #     # print(f"prob_volume_sum4 shape: {prob_volume_sum4.shape}")
-        #     photometric_confidence = torch.gather(prob_volume_sum4, 1, depth_index.unsqueeze(1)).squeeze(1)
-
+      
         samp_variance = (depth_values - depth.unsqueeze(1)) ** 2
 
 
@@ -673,48 +427,6 @@ class CostRegNet_old(nn.Module):
 
 
 
-# class CostRegNet(nn.Module):
-#     def __init__(self, in_channels, base_channels=8):
-#         super(CostRegNet, self).__init__()
-#         self.conv0 = ConvBnReLU3D(in_channels, 8)
-#
-#         self.conv1 = ConvBnReLU3D(8, 16, stride=2)
-#         self.conv2 = ConvBnReLU3D(16, 16)
-#
-#         self.conv3 = ConvBnReLU3D(16, 32, stride=2)
-#         self.conv4 = ConvBnReLU3D(32, 32)
-#
-#         self.conv5 = ConvBnReLU3D(32, 64, stride=2)
-#         self.conv6 = ConvBnReLU3D(64, 64)
-#
-#         self.conv7 = nn.Sequential(
-#             nn.ConvTranspose3d(64, 32, kernel_size=3, padding=1, output_padding=1, stride=2, bias=False),
-#             nn.BatchNorm3d(32),
-#             nn.ReLU(inplace=True))
-#
-#         self.conv9 = nn.Sequential(
-#             nn.ConvTranspose3d(32, 16, kernel_size=3, padding=1, output_padding=1, stride=2, bias=False),
-#             nn.BatchNorm3d(16),
-#             nn.ReLU(inplace=True))
-#
-#         self.conv11 = nn.Sequential(
-#             nn.ConvTranspose3d(16, 8, kernel_size=3, padding=1, output_padding=1, stride=2, bias=False),
-#             nn.BatchNorm3d(8),
-#             nn.ReLU(inplace=True))
-#
-#         self.prob = nn.Conv3d(8, 1, 3, stride=1, padding=1)
-#
-#     def forward(self, x):
-#         conv0 = self.conv0(x)
-#         conv2 = self.conv2(self.conv1(conv0))
-#         conv4 = self.conv4(self.conv3(conv2))
-#         x = self.conv6(self.conv5(conv4))
-#         x = conv4 + self.conv7(x)
-#         x = conv2 + self.conv9(x)
-#         x = conv0 + self.conv11(x)
-#         x = self.prob(x)
-#         return x
-#
 class CostRegNet_noise(nn.Module):
     def __init__(self, in_channels, base_channels=8, num_diffusion_steps=10):
         super(CostRegNet_noise, self).__init__()
@@ -915,27 +627,6 @@ class Diffusion_new(nn.Module):
         return F.mse_loss(predicted_noise, true_noise) + \
             0.3 * F.l1_loss(predicted_noise, true_noise)  # 引入 L1 损失
 
-
-    # def forward_(self, conv0):
-    #     # 初始化输入
-    #     total_loss = 0
-    #     step_weights = self.noise_scheduler / self.noise_scheduler.sum()  # 归一化权重
-    #     for step in range(self.num_diffusion_steps):
-    #         # 添加噪声
-    #         noise_level = self.noise_scheduler[step]  # 获取当前时间步噪声强度
-    #         noisy_input, noise = self.add_noise(conv0, noise_level)
-    #         t = torch.tensor([step / self.num_diffusion_steps], device=conv0.device).float()
-    #         # 卷积降噪过程
-    #         predicted_noise = self.unet(noisy_input, t)
-    #         predicted_conv = noisy_input - predicted_noise
-    #         # weight = step_weights[step]  # 根据噪声调度器获取当前步权重
-    #         # loss = self.diffusion_loss(predicted_noise, noise)
-    #         # weighted_loss = weight * loss
-    #         # total_loss += weighted_loss
-    #         # 更新去噪特征
-    #         conv0 = predicted_conv
-    #     # 输出结果
-    #     return conv0, total_loss
 
 
     def forward_(self, conv0): #训练sd
@@ -1859,99 +1550,6 @@ def visualize_tensor(tensor, title):
 
 
 #
-#
-#
-#
-# # 边缘感知传播
-# def propagate(input_data, dlr, drl, dud, ddu, dim):
-#     """
-#     使用边缘权重在四个方向传播优化。
-#
-#     Args:
-#         input_data: 输入张量，形状为 (B, H, W, C)。
-#         dlr, drl, dud, ddu: 各方向的传播权重。
-#         dim: 通道数。
-#
-#     Returns:
-#         output_data: 优化后的张量。
-#     """
-#     B, H, W, C = input_data.shape
-#
-#     if dim > 1:
-#         dlr = dlr.repeat(1, 1, 1, dim)
-#         drl = drl.repeat(1, 1, 1, dim)
-#         dud = dud.repeat(1, 1, 1, dim)
-#         ddu = ddu.repeat(1, 1, 1, dim)
-#
-#     # 左到右传播
-#     x = torch.zeros((B, H, 1, dim), device=input_data.device)
-#     current_data = torch.cat([x, input_data], dim=2)
-#     current_data = current_data[:, :, :W, :]
-#     output_data = current_data * dlr + input_data * (1 - dlr)
-#
-#     # 右到左传播
-#     x = torch.zeros((B, H, 1, dim), device=input_data.device)
-#     current_data = torch.cat([output_data, x], dim=2)
-#     current_data = current_data[:, :, 1:, :]
-#     output_data = current_data * drl + output_data * (1 - drl)
-#
-#     # 上到下传播
-#     x = torch.zeros((B, 1, W, dim), device=input_data.device)
-#     current_data = torch.cat([x, output_data], dim=1)
-#     current_data = current_data[:, :H, :, :]
-#     output_data = current_data * dud + output_data * (1 - dud)
-#
-#     # 下到上传播
-#     x = torch.zeros((B, 1, W, dim), device=input_data.device)
-#     current_data = torch.cat([output_data, x], dim=1)
-#     current_data = current_data[:, 1:, :, :]
-#     output_data = current_data * ddu + output_data * (1 - ddu)
-#
-#     return output_data
-#
-# # 边缘感知精炼网络
-# class EdgeAwareRefinement(nn.Module):
-#     def __init__(self, crop_size_h, crop_size_w):
-#         super(EdgeAwareRefinement, self).__init__()
-#         self.crop_size_h = crop_size_h
-#         self.crop_size_w = crop_size_w
-#         self.edge_conv1 = nn.Conv2d(4, 32, kernel_size=3, padding=1)
-#         self.edge_conv2 = nn.Conv2d(32, 32, kernel_size=3, padding=1)
-#         self.edge_predictor = nn.Conv2d(32, 8, kernel_size=3, padding=1)
-#
-#     def forward(self, inputs, edges, initial_depth):
-#         """
-#         使用边缘特征对深度进行优化。
-#
-#         Args:
-#             inputs: 输入张量，形状为 (B, H, W, C)。
-#             edges: 边缘图张量，形状为 (B, H, W, 1)。
-#             initial_depth: 初始深度图，形状为 (B, H, W, 1)。
-#
-#         Returns:
-#             refined_depth: 优化后的深度图。
-#         """
-#         # 合并边缘和缩放后的输入
-#         inputs_scaled = inputs * 0.00784
-#         edge_inputs = torch.cat([edges, inputs_scaled], dim=1)
-#
-#         # 边缘特征提取
-#         x = F.relu(self.edge_conv1(edge_inputs))
-#         x = F.relu(self.edge_conv2(x))
-#
-#         # 预测边缘权重
-#         edge_weights = self.edge_predictor(x)
-#         edge_weights = edge_weights + torch.tile(edges, (1, 8, 1, 1))
-#         edge_weights = torch.clamp(edge_weights, 0.0, 1.0)
-#
-#         # 拆分边缘权重
-#         dlr, drl, dud, ddu, nlr, nrl, nud, ndu = torch.split(edge_weights, 1, dim=1)
-#
-#         # 传播深度
-#         refined_depth = propagate(initial_depth, dlr, drl, dud, ddu, dim=1)
-#         return refined_depth
-
-
 import torchvision.utils as vutils
 import os
 import matplotlib.cm as cm
@@ -2356,127 +1954,6 @@ def save_combined_image(image1, image2, output_path="output_combined.png"):
 
 
     
-
-# class DoubleConv(nn.Module):
-#     def __init__(self, in_channels, out_channels):
-#         super(DoubleConv, self).__init__()
-#         self.double_conv = nn.Sequential(
-#             nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=True),
-#             nn.InstanceNorm2d(out_channels, affine=True),
-#             nn.ReLU(inplace=False),  # Explicitly disable inplace ReLU
-#             nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=True),
-#             nn.InstanceNorm2d(out_channels, affine=True),
-#             nn.ReLU(inplace=False)   # Explicitly disable inplace ReLU
-#         )
-
-#     def forward(self, x):
-#         return self.double_conv(x)
-# class UNetDiffusion(nn.Module):
-#     def __init__(self, in_channels=3, out_channels=3, base_channels=32):
-#         super(UNetDiffusion, self).__init__()
-#         self.in_channels = in_channels
-#         self.out_channels = out_channels
-
-#         # Encoder
-#         self.enc1 = DoubleConv(in_channels, base_channels)
-#         self.enc2 = DoubleConv(base_channels, base_channels * 2)
-#         self.enc3 = DoubleConv(base_channels * 2, base_channels * 4)
-#         self.pool = nn.MaxPool2d(2)
-
-#         # Middle
-#         self.middle = DoubleConv(base_channels * 4, base_channels * 8)
-
-#         # Decoder
-#         self.up3 = nn.ConvTranspose2d(base_channels * 8, base_channels * 4, kernel_size=2, stride=2)
-#         self.dec3 = DoubleConv(base_channels * 8, base_channels * 4)
-#         self.up2 = nn.ConvTranspose2d(base_channels * 4, base_channels * 2, kernel_size=2, stride=2)
-#         self.dec2 = DoubleConv(base_channels * 4, base_channels * 2)
-#         self.up1 = nn.ConvTranspose2d(base_channels * 2, base_channels, kernel_size=2, stride=2)
-#         self.dec1 = DoubleConv(base_channels * 2, base_channels)
-
-#         # Final conv
-#         self.final_conv = nn.Conv2d(base_channels, out_channels, kernel_size=1)
-
-#         # Time embedding for diffusion
-#         self.time_dim = base_channels * 8
-#         self.time_embed = nn.Sequential(
-#             nn.Linear(1, self.time_dim),
-#             nn.SiLU(),
-#             nn.Linear(self.time_dim, self.time_dim)
-#         )
-
-#     def forward(self, x, t, x_normal=None):
-#         # Time embedding
-#         t = t.unsqueeze(-1).float()  # Shape: (batch_size, 1)
-#         t_emb = self.time_embed(t)   # Shape: (batch_size, time_dim)
-
-#         # Encoder
-#         e1 = self.enc1(x)
-#         e2 = self.enc2(self.pool(e1))
-#         e3 = self.enc3(self.pool(e2))
-#         m = self.middle(self.pool(e3))
-
-#         # Add time embedding to middle
-#         t_emb = t_emb.view(-1, self.time_dim, 1, 1)
-#         m = m + t_emb
-
-#         # Decoder
-#         d3 = self.up3(m)
-#         d3 = self.dec3(torch.cat([d3, e3], dim=1))
-#         d2 = self.up2(d3)
-#         d2 = self.dec2(torch.cat([d2, e2], dim=1))
-#         d1 = self.up1(d2)
-#         d1 = self.dec1(torch.cat([d1, e1], dim=1))
-
-#         # Final output
-#         out = self.final_conv(d1)
-
-#         # Compute loss if normal light image is provided (training)
-#         loss = None
-#         if x_normal is not None:
-#             loss = F.mse_loss(out, x_normal)
-
-#         return out, loss
-
-# class DiffusionModel(nn.Module):
-#     def __init__(self, in_channels=3, out_channels=3, base_channels=32, timesteps=1000):
-#         super(DiffusionModel, self).__init__()
-#         self.unet = UNetDiffusion(in_channels, out_channels, base_channels)
-#         self.timesteps = timesteps
-#         self.beta = torch.linspace(0.0001, 0.02, timesteps).cuda()
-#         self.alpha = 1. - self.beta
-#         self.alpha_bar = torch.cumprod(self.alpha, dim=0)
-
-#     def forward(self, x_lowlight, x_normal=None):
-#         batch_size = x_lowlight.shape[0]
-#         t = torch.randint(0, self.timesteps, (batch_size,), device=x_lowlight.device).float() / self.timesteps
-#         out, loss = self.unet(x_lowlight, t, x_normal)
-#         return out, loss
-
-#     # @torch.no_grad()
-#     # def sample(self, x_lowlight):
-#     #     x = x_lowlight
-#     #     self.timesteps=100
-#     #     for t in reversed(range(self.timesteps)):
-#     #         t_tensor = torch.full((x.shape[0],), t / self.timesteps, device=x.device)
-#     #         x, _ = self.unet(x, t_tensor)
-#     #     return x
-
-
-#     @torch.no_grad()
-#     def sample(self, x_lowlight):
-#         x = x_lowlight
-
-#         for t in reversed(range(self.timesteps)):
-#             t_tensor = (torch.full((x.shape[0],), t, device=x.device).float() / self.timesteps).cuda()
-#             predicted_noise, _ = self.unet(x, t_tensor)
-#             # DDPM reverse process
-#             beta_t = self.beta[t].view(-1, 1, 1, 1)
-#             alpha_t = self.alpha[t].view(-1, 1, 1, 1)
-#             alpha_bar_t = self.alpha_bar[t].view(-1, 1, 1, 1)
-#             z = torch.randn_like(x) if t > 0 else 0
-#             x = (1 / torch.sqrt(alpha_t)) * (x - ((1 - alpha_t) / torch.sqrt(1 - alpha_bar_t)) * predicted_noise) + torch.sqrt(beta_t) * z
-#         return x
 
 def simulate_non_uniform_low_light(img_batch, method='shadow', device='cuda'):
     """
